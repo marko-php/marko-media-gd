@@ -10,13 +10,27 @@ use Marko\MediaGd\Exceptions\GdProcessingException;
 
 class GdImageProcessor implements ImageProcessorInterface
 {
+    public const int DEFAULT_MAX_PIXELS = 50_000_000;
+
+    public const int DEFAULT_MAX_DIMENSION = 16384;
+
     /**
      * @throws GdProcessingException
      */
-    public function __construct()
-    {
+    public function __construct(
+        private int $maxPixels = self::DEFAULT_MAX_PIXELS,
+        private int $maxDimension = self::DEFAULT_MAX_DIMENSION,
+    ) {
         if (!$this->isGdAvailable()) {
             throw GdProcessingException::extensionUnavailable();
+        }
+
+        if ($maxPixels < 1) {
+            throw GdProcessingException::invalidLimit('max_pixels', $maxPixels);
+        }
+
+        if ($maxDimension < 1) {
+            throw GdProcessingException::invalidLimit('max_dimension', $maxDimension);
         }
     }
 
@@ -34,6 +48,7 @@ class GdImageProcessor implements ImageProcessorInterface
         int $height,
         bool $maintainAspect = true,
     ): string {
+        $this->assertTargetDimensions('resize', $width, $height);
         $source = $this->loadImage($imagePath);
         $extension = $this->detectFormat($imagePath);
 
@@ -66,6 +81,12 @@ class GdImageProcessor implements ImageProcessorInterface
         int $width,
         int $height,
     ): string {
+        $this->assertTargetDimensions('crop', $width, $height);
+
+        if ($x < 0 || $y < 0) {
+            throw GdProcessingException::invalidCropOffset($x, $y);
+        }
+
         $source = $this->loadImage($imagePath);
         $extension = $this->detectFormat($imagePath);
 
@@ -102,16 +123,17 @@ class GdImageProcessor implements ImageProcessorInterface
         string $imagePath,
         int $maxDimension,
     ): string {
+        $this->assertTargetDimensions('thumbnail', $maxDimension, $maxDimension);
         $source = $this->loadImage($imagePath);
         $sourceWidth = imagesx($source);
         $sourceHeight = imagesy($source);
 
         if ($sourceWidth >= $sourceHeight) {
             $newWidth = $maxDimension;
-            $newHeight = (int) round($sourceHeight * $maxDimension / $sourceWidth);
+            $newHeight = max(1, (int) round($sourceHeight * $maxDimension / $sourceWidth));
         } else {
             $newHeight = $maxDimension;
-            $newWidth = (int) round($sourceWidth * $maxDimension / $sourceHeight);
+            $newWidth = max(1, (int) round($sourceWidth * $maxDimension / $sourceHeight));
         }
 
         return $this->resize($imagePath, $newWidth, $newHeight, false);
@@ -178,6 +200,27 @@ class GdImageProcessor implements ImageProcessorInterface
     private function loadImage(
         string $imagePath,
     ): GdImage {
+        // Read the declared dimensions from the header before decoding: a tiny
+        // file can declare a huge canvas, and GD would try to allocate all of
+        // it, hitting memory_limit with an uncatchable fatal error.
+        $size = @getimagesize($imagePath);
+
+        if ($size === false) {
+            throw GdProcessingException::processingFailed('load', $imagePath);
+        }
+
+        [$width, $height] = $size;
+
+        if (!$this->withinLimits($width, $height)) {
+            throw GdProcessingException::sourceTooLarge(
+                $imagePath,
+                $width,
+                $height,
+                $this->maxPixels,
+                $this->maxDimension,
+            );
+        }
+
         $contents = file_get_contents($imagePath);
 
         if ($contents === false) {
@@ -226,8 +269,36 @@ class GdImageProcessor implements ImageProcessorInterface
         $ratio = min($widthRatio, $heightRatio);
 
         return [
-            (int) round($sourceWidth * $ratio),
-            (int) round($sourceHeight * $ratio),
+            max(1, (int) round($sourceWidth * $ratio)),
+            max(1, (int) round($sourceHeight * $ratio)),
         ];
+    }
+
+    /**
+     * @throws GdProcessingException
+     */
+    private function assertTargetDimensions(
+        string $operation,
+        int $width,
+        int $height,
+    ): void {
+        if ($width < 1 || $height < 1 || !$this->withinLimits($width, $height)) {
+            throw GdProcessingException::invalidTargetDimensions(
+                $operation,
+                $width,
+                $height,
+                $this->maxPixels,
+                $this->maxDimension,
+            );
+        }
+    }
+
+    private function withinLimits(
+        int $width,
+        int $height,
+    ): bool {
+        return $width <= $this->maxDimension
+            && $height <= $this->maxDimension
+            && $width * $height <= $this->maxPixels;
     }
 }
